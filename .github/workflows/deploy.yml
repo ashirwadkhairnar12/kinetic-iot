@@ -1,12 +1,13 @@
-# =============================================================
 # .github/workflows/deploy.yml
 #
 # Flow:
 #   Push to any branch
 #     → Build Docker image (linux/amd64)
-#     → Tag as <branch>-<commit_sha>  +  latest-<branch>
+#     → Tag as <branch>-<commit_sha>
 #     → Push to ECR
+#     → Re-tag as latest-<branch> using imagetools (no overwrite)
 #     → Delete old images keeping only last 2 per branch
+#     → Strip invalid fields from task definition
 #     → Update ECS service for that branch
 #
 # GitHub Secrets required (Settings → Secrets → Actions):
@@ -27,9 +28,9 @@ on:
       - '**'
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_REGION:     ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_CLUSTER:    ${{ secrets.ECS_CLUSTER }}
 
 jobs:
   deploy:
@@ -42,7 +43,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Set up Docker Buildx (required for --platform) ─────
+      # ── 2. Set up Docker Buildx ───────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -55,8 +56,8 @@ jobs:
           IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
           ECS_SERVICE="iot-dashboard-${BRANCH}"
 
-          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "branch=${BRANCH}"           >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}"     >> $GITHUB_OUTPUT
           echo "ecs_service=${ECS_SERVICE}" >> $GITHUB_OUTPUT
 
           echo "📦 Image tag : ${IMAGE_TAG}"
@@ -66,38 +67,45 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
       # ── 5. Login to ECR ───────────────────────────────────────
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ── 6. Build & push (linux/amd64 for Fargate) ─────────────
+      # ── 6. Build & push SHA-tagged image ──────────────────────
+      #    Then re-tag as latest-<branch> via imagetools
+      #    (avoids the dual -t overwrite bug in buildx)
       - name: Build, tag, and push image to ECR
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
-          BRANCH: ${{ steps.vars.outputs.branch }}
+          IMAGE_TAG:    ${{ steps.vars.outputs.image_tag }}
+          BRANCH:       ${{ steps.vars.outputs.branch }}
         run: |
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           LATEST_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-${BRANCH}"
 
+          # Build and push with SHA tag only
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
-            --cache-from "${LATEST_URI}" \
             --push \
             -t "${IMAGE_URI}" \
-            -t "${LATEST_URI}" \
             .
 
+          # Re-tag as latest-<branch> from the already-pushed image
+          # imagetools create never overwrites the SHA tag
+          docker buildx imagetools create \
+            --tag "${LATEST_URI}" \
+            "${IMAGE_URI}"
+
           echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
-          echo "✅ Pushed: ${IMAGE_URI}"
-          echo "✅ Pushed: ${LATEST_URI}"
+          echo "✅ Pushed SHA tag : ${IMAGE_URI}"
+          echo "✅ Pushed latest  : ${LATEST_URI}"
 
       # ── 7. Delete old images — keep only last 2 per branch ────
       - name: Cleanup old ECR images (keep last 2)
@@ -119,7 +127,7 @@ jobs:
 
           if [ "$TOTAL" -gt 2 ]; then
             DELETE_TAGS=$(echo "$IMAGE_TAGS" | head -n $(( TOTAL - 2 )))
-            echo "Deleting $(echo "$DELETE_TAGS" | wc -l) old image(s):"
+            echo "Deleting $(echo "$DELETE_TAGS" | wc -l | tr -d ' ') old image(s):"
             echo "$DELETE_TAGS"
 
             IMAGE_IDS=$(echo "$DELETE_TAGS" | \
@@ -132,7 +140,22 @@ jobs:
 
             echo "✅ Old images deleted"
           else
-            echo "✅ Only ${TOTAL} image(s) found — nothing to delete"
+            echo "✅ Only ${TOTAL} image(s) — nothing to delete"
+          fi
+
+          # Also clean up untagged images
+          UNTAGGED=$(aws ecr list-images \
+            --repository-name ${{ secrets.ECR_REPOSITORY }} \
+            --filter tagStatus=UNTAGGED \
+            --query 'imageIds[*]' \
+            --output json)
+
+          if [ "$UNTAGGED" != "[]" ]; then
+            echo "🧹 Deleting untagged images..."
+            aws ecr batch-delete-image \
+              --repository-name ${{ secrets.ECR_REPOSITORY }} \
+              --image-ids "$UNTAGGED"
+            echo "✅ Untagged images deleted"
           fi
 
       # ── 8. Download current task definition ───────────────────
@@ -142,10 +165,9 @@ jobs:
             --task-definition ${{ secrets.TASK_DEFINITION_FAMILY }} \
             --query taskDefinition \
             > task-definition.json
-
           echo "📄 Task definition downloaded"
 
-      # ── 9. Strip unsupported fields from task definition ──────
+      # ── 9. Strip fields that break task definition registration ─
       - name: Clean task definition
         run: |
           jq 'del(
@@ -158,12 +180,10 @@ jobs:
             .registeredAt,
             .registeredBy
           )' task-definition.json > clean-task-definition.json
-
           mv clean-task-definition.json task-definition.json
-
           echo "🧹 Cleaned task definition"
-          echo "📄 Image in task def:"
-          jq '.containerDefinitions[0].image' task-definition.json
+          echo "📄 Image currently in task def:"
+          jq -r '.containerDefinitions[0].image' task-definition.json
 
       # ── 10. Inject new image URI into task definition ─────────
       - name: Update image in task definition
@@ -171,20 +191,26 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1.4.0
         with:
           task-definition: task-definition.json
-          container-name: ${{ secrets.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image_uri }}
+          container-name:  ${{ secrets.CONTAINER_NAME }}
+          image:           ${{ steps.build-image.outputs.image_uri }}
 
-      # ── 11. Deploy to branch-specific ECS service ─────────────
+      # ── 11. Verify image before deploying ─────────────────────
+      - name: Verify image in task definition
+        run: |
+          echo "📄 Image being deployed:"
+          jq -r '.containerDefinitions[0].image' ${{ steps.task-def.outputs.task-definition }}
+
+      # ── 12. Deploy to branch-specific ECS service ─────────────
       - name: Deploy to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ steps.vars.outputs.ecs_service }}
-          cluster: ${{ env.ECS_CLUSTER }}
+          task-definition:            ${{ steps.task-def.outputs.task-definition }}
+          service:                    ${{ steps.vars.outputs.ecs_service }}
+          cluster:                    ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-          force-new-deployment: true
+          force-new-deployment:       true
 
-      # ── 12. Summary ───────────────────────────────────────────
+      # ── 13. Summary ───────────────────────────────────────────
       - name: Deployment summary
         run: |
           echo "════════════════════════════════════════"
