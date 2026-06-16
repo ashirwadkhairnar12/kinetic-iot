@@ -93,7 +93,7 @@ jobs:
             --push \
             -t "${IMAGE_URI}" \
             -t "${LATEST_URI}" \
-            ./dashboard
+            .
 
           echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
           echo "✅ Pushed: ${IMAGE_URI}"
