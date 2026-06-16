@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IoT Telemetry Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #21262d;
+    --accent:   #00d4aa;
+    --accent2:  #f78166;
+    --accent3:  #d2a679;
+    --text:     #e6edf3;
+    --muted:    #8b949e;
+    --warn:     #f0883e;
+    --ok:       #3fb950;
+    --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    --font-sans: 'Inter', system-ui, sans-serif;
+    --radius: 10px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    min-height: 100vh;
+  }
+
+  /* --- Header --- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 28px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; }
+  .logo-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .logo h1 { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+  .logo span { color: var(--accent); }
+  .header-meta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+  #live-clock { color: var(--accent); }
+
+  /* --- Layout --- */
+  main { padding: 24px 28px; max-width: 1600px; margin: 0 auto; }
+
+  /* --- KPI cards --- */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+  .kpi-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  .kpi-card::before {
+    content: "";
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: var(--accent);
+  }
+  .kpi-card.warn::before { background: var(--warn); }
+  .kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .kpi-value { font-size: 28px; font-weight: 700; font-family: var(--font-mono); color: var(--text); }
+  .kpi-unit  { font-size: 13px; color: var(--muted); margin-left: 4px; }
+  .kpi-sub   { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* --- Content grid --- */
+  .content-grid {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 18px;
+    margin-bottom: 18px;
+  }
+  @media (max-width: 900px) { .content-grid { grid-template-columns: 1fr; } }
+
+  /* --- Panels --- */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-title { font-size: 13px; font-weight: 600; color: var(--text); }
+  .panel-body { padding: 14px 18px; }
+
+  /* --- Device list --- */
+  .device-list { list-style: none; }
+  .device-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background .15s;
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+  .device-item:hover { background: rgba(0,212,170,.06); }
+  .device-item.selected { background: rgba(0,212,170,.12); }
+  .device-status {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .status-ok   { background: var(--ok);   box-shadow: 0 0 6px var(--ok); }
+  .status-warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  .device-info { flex: 1; min-width: 0; }
+  .device-name { font-size: 13px; font-weight: 500; }
+  .device-meta { font-size: 11px; color: var(--muted); font-family: var(--font-mono); }
+  .device-temp { font-size: 14px; font-family: var(--font-mono); color: var(--accent); }
+
+  /* --- Chart area --- */
+  .chart-controls {
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .btn {
+    padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: transparent; color: var(--muted); font-size: 12px;
+    cursor: pointer; transition: all .15s;
+  }
+  .btn:hover, .btn.active {
+    border-color: var(--accent); color: var(--accent); background: rgba(0,212,170,.08);
+  }
+  .chart-wrapper { position: relative; height: 260px; margin-top: 14px; }
+
+  /* --- Bottom row --- */
+  .bottom-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
+
+  /* --- Alerts table --- */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    text-align: left; padding: 8px 10px;
+    color: var(--muted); font-weight: 500;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: var(--font-mono);
+  }
+  .badge-warn { background: rgba(240,136,62,.15); color: var(--warn); }
+  .badge-ok   { background: rgba(63,185,80,.15);  color: var(--ok);   }
+
+  /* --- Gauge row --- */
+  .gauge-row {
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .gauge-item label {
+    display: flex; justify-content: space-between;
+    font-size: 12px; color: var(--muted); margin-bottom: 5px;
+  }
+  .gauge-item label span { color: var(--text); font-family: var(--font-mono); }
+  .gauge-bar {
+    height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+  }
+  .gauge-fill {
+    height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), #00ffcc);
+    transition: width .6s ease;
+  }
+  .gauge-fill.warn { background: linear-gradient(90deg, var(--warn), #ffaa44); }
+
+  /* --- Empty / loading state --- */
+  .loading { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+
+  /* --- Refresh indicator --- */
+  .refresh-tag {
+    font-size: 11px; color: var(--muted); font-family: var(--font-mono);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .refresh-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  }
+  .refresh-dot.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <h1>IoT <span>Telemetry</span> Dashboard</h1>
+  </div>
+  <div class="header-meta">
+    <span id="live-clock">--:--:--</span> &nbsp;|&nbsp; Auto-refresh every 10s
+  </div>
+</header>
+
+<main>
+
+  <!-- KPI strip -->
+  <div class="kpi-grid" id="kpi-grid">
+    <div class="kpi-card"><div class="kpi-label">Devices Online</div><div class="kpi-value" id="k-devices">—</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg Temperature</div><div class="kpi-value" id="k-temp">—</div><span class="kpi-unit">°C</span></div>
+    <div class="kpi-card"><div class="kpi-label">Avg Humidity</div><div class="kpi-value" id="k-hum">—</div><span class="kpi-unit">%</span></div>
+    <div class="kpi-card"><div class="kpi-label">Avg Power</div><div class="kpi-value" id="k-power">—</div><span class="kpi-unit">W</span></div>
+    <div class="kpi-card warn"><div class="kpi-label">Active Alerts</div><div class="kpi-value" id="k-alerts">—</div></div>
+    <div class="kpi-card"><div class="kpi-label">Readings (1h)</div><div class="kpi-value" id="k-readings">—</div></div>
+  </div>
+
+  <!-- Devices list + Chart -->
+  <div class="content-grid">
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Device Fleet</span>
+        <span class="refresh-tag"><span class="refresh-dot" id="refresh-dot"></span> live</span>
+      </div>
+      <div class="panel-body">
+        <ul class="device-list" id="device-list">
+          <li class="loading">Loading devices…</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title" id="chart-title">Temperature — device-001</span>
+        <div class="chart-controls">
+          <button class="btn active" onclick="setMetric('temperature_c',this)">Temp</button>
+          <button class="btn" onclick="setMetric('humidity_pct',this)">Humidity</button>
+          <button class="btn" onclick="setMetric('power_watts',this)">Power</button>
+          <button class="btn" onclick="setMetric('vibration_ms2',this)">Vibration</button>
+          <button class="btn" onclick="setHours(1,this)">1h</button>
+          <button class="btn active" onclick="setHours(6,this)">6h</button>
+          <button class="btn" onclick="setHours(24,this)">24h</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="chart-wrapper">
+          <canvas id="ts-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Alerts + Gauges -->
+  <div class="bottom-grid">
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Recent Alerts</span>
+      </div>
+      <div class="panel-body" style="padding:0">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Device</th><th>Status</th><th>Battery</th><th>Temp</th></tr>
+          </thead>
+          <tbody id="alerts-body">
+            <tr><td colspan="5" class="loading">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title" id="gauge-title">Live Metrics — device-001</span>
+      </div>
+      <div class="panel-body">
+        <div class="gauge-row" id="gauge-row">
+          <div class="loading">Select a device to see gauges.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let selectedDevice = null;
+let currentMetric  = "temperature_c";
+let currentHours   = 6;
+let tsChart        = null;
+
+const METRIC_LABELS = {
+  temperature_c: "Temperature (°C)",
+  humidity_pct:  "Humidity (%)",
+  power_watts:   "Power (W)",
+  vibration_ms2: "Vibration (m/s²)",
+  battery_pct:   "Battery (%)",
+};
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  document.getElementById("live-clock").textContent =
+    new Date().toLocaleTimeString("en-GB");
+}, 1000);
+
+// ---------------------------------------------------------------------------
+// Fetch helpers
+// ---------------------------------------------------------------------------
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(r.statusText);
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
+// KPI summary
+// ---------------------------------------------------------------------------
+async function loadSummary() {
+  try {
+    const d = await api("/api/summary");
+    document.getElementById("k-devices").textContent  = d.total_devices  ?? "—";
+    document.getElementById("k-temp").textContent     = d.avg_temperature ?? "—";
+    document.getElementById("k-hum").textContent      = d.avg_humidity    ?? "—";
+    document.getElementById("k-power").textContent    = d.avg_power       ?? "—";
+    document.getElementById("k-alerts").textContent   = d.alert_count     ?? "—";
+    document.getElementById("k-readings").textContent = d.total_readings  ?? "—";
+  } catch(e) { console.error("summary:", e); }
+}
+
+// ---------------------------------------------------------------------------
+// Device list
+// ---------------------------------------------------------------------------
+async function loadDevices() {
+  const dot = document.getElementById("refresh-dot");
+  dot.classList.add("spinning");
+  try {
+    const devices = await api("/api/devices");
+    const ul = document.getElementById("device-list");
+    ul.innerHTML = "";
+    if (!devices.length) { ul.innerHTML = '<li class="loading">No devices found.</li>'; return; }
+
+    if (!selectedDevice) selectedDevice = devices[0].device_id;
+
+    devices.forEach(d => {
+      const li = document.createElement("li");
+      li.className = "device-item" + (d.device_id === selectedDevice ? " selected" : "");
+      li.innerHTML = `
+        <div class="device-status ${d.status === 'OK' ? 'status-ok' : 'status-warn'}"></div>
+        <div class="device-info">
+          <div class="device-name">${d.device_id}</div>
+          <div class="device-meta">${d.device_type ?? "sensor"} · bat ${(d.battery_pct??0).toFixed(0)}%</div>
+        </div>
+        <div class="device-temp">${(d.temperature_c??0).toFixed(1)}°</div>
+      `;
+      li.onclick = () => selectDevice(d.device_id);
+      ul.appendChild(li);
+    });
+
+    updateGauges(devices.find(d => d.device_id === selectedDevice));
+  } catch(e) { console.error("devices:", e); }
+  dot.classList.remove("spinning");
+}
+
+// ---------------------------------------------------------------------------
+// Select device
+// ---------------------------------------------------------------------------
+function selectDevice(id) {
+  selectedDevice = id;
+  document.querySelectorAll(".device-item").forEach(el => {
+    el.classList.toggle("selected", el.querySelector(".device-name").textContent === id);
+  });
+  document.getElementById("chart-title").textContent =
+    `${METRIC_LABELS[currentMetric]} — ${id}`;
+  loadTimeseries();
+}
+
+// ---------------------------------------------------------------------------
+// Timeseries chart
+// ---------------------------------------------------------------------------
+async function loadTimeseries() {
+  if (!selectedDevice) return;
+  try {
+    const data = await api(`/api/timeseries/${selectedDevice}?metric=${currentMetric}&hours=${currentHours}`);
+    const labels = data.map(p => {
+      const d = new Date(p.time);
+      return d.toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+    });
+    const values = data.map(p => p.value);
+
+    if (tsChart) {
+      tsChart.data.labels = labels;
+      tsChart.data.datasets[0].data = values;
+      tsChart.data.datasets[0].label = METRIC_LABELS[currentMetric];
+      tsChart.update("active");
+    } else {
+      const ctx = document.getElementById("ts-chart").getContext("2d");
+      tsChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [{
+            label: METRIC_LABELS[currentMetric],
+            data: values,
+            borderColor: "#00d4aa",
+            backgroundColor: "rgba(0,212,170,.08)",
+            borderWidth: 2,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            tension: 0.35,
+            fill: true,
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "#161b22",
+              borderColor: "#21262d", borderWidth: 1,
+              titleColor: "#8b949e", bodyColor: "#e6edf3",
+            }
+          },
+          scales: {
+            x: { grid:{ color:"rgba(255,255,255,.04)" }, ticks:{ color:"#8b949e", maxTicksLimit:8, font:{size:11} } },
+            y: { grid:{ color:"rgba(255,255,255,.04)" }, ticks:{ color:"#8b949e", font:{size:11} } }
+          }
+        }
+      });
+    }
+  } catch(e) { console.error("timeseries:", e); }
+}
+
+// ---------------------------------------------------------------------------
+// Gauges
+// ---------------------------------------------------------------------------
+function updateGauges(device) {
+  if (!device) return;
+  document.getElementById("gauge-title").textContent = `Live Metrics — ${device.device_id}`;
+  const items = [
+    { label:"Temperature", value: device.temperature_c, max:60, unit:"°C" },
+    { label:"Humidity",    value: device.humidity_pct,  max:100, unit:"%"  },
+    { label:"Power",       value: device.power_watts,   max:500, unit:"W"  },
+    { label:"Battery",     value: device.battery_pct,   max:100, unit:"%", warn: device.battery_pct < 25 },
+  ];
+  const container = document.getElementById("gauge-row");
+  container.innerHTML = items.map(it => {
+    const pct = Math.min(100, ((it.value ?? 0) / it.max) * 100);
+    return `
+      <div class="gauge-item">
+        <label>${it.label} <span>${(it.value??0).toFixed(1)} ${it.unit}</span></label>
+        <div class="gauge-bar"><div class="gauge-fill ${it.warn?'warn':''}" style="width:${pct}%"></div></div>
+      </div>`;
+  }).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Alerts table
+// ---------------------------------------------------------------------------
+async function loadAlerts() {
+  try {
+    const rows = await api("/api/alerts");
+    const tbody = document.getElementById("alerts-body");
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="loading">No alerts 🎉</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.slice(0,10).map(r => `
+      <tr>
+        <td style="font-family:var(--font-mono);font-size:11px;color:var(--muted)">
+          ${new Date(r.time).toLocaleString("en-GB",{hour12:false})}
+        </td>
+        <td>${r.device_id}</td>
+        <td><span class="badge badge-warn">${r.status}</span></td>
+        <td style="font-family:var(--font-mono)">${(r.battery_pct??0).toFixed(0)}%</td>
+        <td style="font-family:var(--font-mono)">${(r.temperature_c??0).toFixed(1)}°C</td>
+      </tr>`).join("");
+  } catch(e) { console.error("alerts:", e); }
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+function setMetric(m, btn) {
+  currentMetric = m;
+  document.querySelectorAll(".chart-controls .btn").forEach(b => {
+    if (["Temp","Humidity","Power","Vibration"].some(x => b.textContent === x))
+      b.classList.remove("active");
+  });
+  btn.classList.add("active");
+  document.getElementById("chart-title").textContent =
+    `${METRIC_LABELS[m]} — ${selectedDevice ?? ""}`;
+  loadTimeseries();
+}
+
+function setHours(h, btn) {
+  currentHours = h;
+  document.querySelectorAll(".chart-controls .btn").forEach(b => {
+    if (["1h","6h","24h"].includes(b.textContent)) b.classList.remove("active");
+  });
+  btn.classList.add("active");
+  loadTimeseries();
+}
+
+// ---------------------------------------------------------------------------
+// Boot + polling
+// ---------------------------------------------------------------------------
+async function refresh() {
+  await Promise.all([loadSummary(), loadDevices(), loadAlerts()]);
+  await loadTimeseries();
+}
+
+refresh();
+setInterval(refresh, 10_000);
+</script>
+</body>
+</html>
