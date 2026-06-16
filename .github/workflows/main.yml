@@ -1,0 +1,178 @@
+# =============================================================
+# .github/workflows/deploy.yml
+#
+# Flow:
+#   Push to any branch
+#     → Build Docker image (linux/amd64)
+#     → Tag as <branch>-<commit_sha>  +  latest-<branch>
+#     → Push to ECR
+#     → Delete old images keeping only last 2 per branch
+#     → Update ECS service for that branch
+#
+# GitHub Secrets required (Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_REGION              e.g. ap-south-1
+#   ECR_REPOSITORY          e.g. iot-dashboard
+#   ECS_CLUSTER             e.g. iot-cluster
+#   TASK_DEFINITION_FAMILY  e.g. iot-dashboard-task
+#   CONTAINER_NAME          e.g. iot-dashboard
+# =============================================================
+
+name: Build & Deploy to ECS
+
+on:
+  push:
+    branches:
+      - '**'
+
+env:
+  AWS_REGION:     ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER:    ${{ secrets.ECS_CLUSTER }}
+
+jobs:
+  deploy:
+    name: Build → ECR → ECS (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── 1. Checkout ───────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Docker Buildx (required for --platform) ─────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Derive branch name & image tag ─────────────────────
+      - name: Set image tag
+        id: vars
+        run: |
+          BRANCH=$(echo "${GITHUB_REF_NAME}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
+          ECS_SERVICE="iot-dashboard-${BRANCH}"
+
+          echo "branch=${BRANCH}"           >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}"     >> $GITHUB_OUTPUT
+          echo "ecs_service=${ECS_SERVICE}" >> $GITHUB_OUTPUT
+
+          echo "📦 Image tag : ${IMAGE_TAG}"
+          echo "🚀 ECS service: ${ECS_SERVICE}"
+
+      # ── 4. Configure AWS credentials ──────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ── 5. Login to ECR ───────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── 6. Build & push (linux/amd64 for Fargate) ─────────────
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ steps.vars.outputs.image_tag }}
+          BRANCH:       ${{ steps.vars.outputs.branch }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          LATEST_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-${BRANCH}"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --cache-from "${LATEST_URI}" \
+            --push \
+            -t "${IMAGE_URI}" \
+            -t "${LATEST_URI}" \
+            .
+
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "✅ Pushed: ${IMAGE_URI}"
+          echo "✅ Pushed: ${LATEST_URI}"
+
+      # ── 7. Delete old images — keep only last 2 per branch ────
+      - name: Cleanup old ECR images (keep last 2)
+        env:
+          BRANCH: ${{ steps.vars.outputs.branch }}
+        run: |
+          echo "🧹 Cleaning up old images for branch: ${BRANCH}"
+
+          # Get all images for this branch (tagged <branch>-<sha>), sorted oldest first
+          IMAGE_TAGS=$(aws ecr list-images \
+            --repository-name ${{ secrets.ECR_REPOSITORY }} \
+            --filter tagStatus=TAGGED \
+            --query "imageIds[?starts_with(imageTag, '${BRANCH}-')].imageTag" \
+            --output json \
+            | jq -r '.[]' \
+            | sort)
+
+          TOTAL=$(echo "$IMAGE_TAGS" | grep -c . || true)
+          echo "Found ${TOTAL} versioned image(s) for branch '${BRANCH}'"
+
+          # Keep the 2 most recent, delete the rest
+          if [ "$TOTAL" -gt 2 ]; then
+            DELETE_TAGS=$(echo "$IMAGE_TAGS" | head -n $(( TOTAL - 2 )))
+            echo "Deleting $(echo "$DELETE_TAGS" | wc -l) old image(s):"
+            echo "$DELETE_TAGS"
+
+            # Build JSON array for batch delete
+            IMAGE_IDS=$(echo "$DELETE_TAGS" | \
+              jq -R '{imageTag: .}' | \
+              jq -s '.')
+
+            aws ecr batch-delete-image \
+              --repository-name ${{ secrets.ECR_REPOSITORY }} \
+              --image-ids "$IMAGE_IDS"
+
+            echo "✅ Old images deleted"
+          else
+            echo "✅ Only ${TOTAL} image(s) found — nothing to delete"
+          fi
+
+      # ── 8. Download current task definition ───────────────────
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.TASK_DEFINITION_FAMILY }} \
+            --query taskDefinition \
+            > task-definition.json
+          echo "📄 Task definition downloaded"
+
+      # ── 9. Inject new image URI into task definition ──────────
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name:  ${{ secrets.CONTAINER_NAME }}
+          image:           ${{ steps.build-image.outputs.image_uri }}
+
+      # ── 10. Deploy to branch-specific ECS service ─────────────
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:          ${{ steps.task-def.outputs.task-definition }}
+          service:                  ${{ steps.vars.outputs.ecs_service }}
+          cluster:                  ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          force-new-deployment:     true
+
+      # ── 11. Summary ───────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  ✅  Deployment complete"
+          echo "  Branch  : ${{ steps.vars.outputs.branch }}"
+          echo "  Image   : ${{ steps.build-image.outputs.image_uri }}"
+          echo "  Service : ${{ steps.vars.outputs.ecs_service }}"
+          echo "  Cluster : ${{ env.ECS_CLUSTER }}"
+          echo "════════════════════════════════════════"
