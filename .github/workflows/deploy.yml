@@ -27,9 +27,9 @@ on:
       - '**'
 
 env:
-  AWS_REGION:     ${{ secrets.AWS_REGION }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  ECS_CLUSTER:    ${{ secrets.ECS_CLUSTER }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
 
 jobs:
   deploy:
@@ -55,8 +55,8 @@ jobs:
           IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
           ECS_SERVICE="iot-dashboard-${BRANCH}"
 
-          echo "branch=${BRANCH}"           >> $GITHUB_OUTPUT
-          echo "image_tag=${IMAGE_TAG}"     >> $GITHUB_OUTPUT
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
           echo "ecs_service=${ECS_SERVICE}" >> $GITHUB_OUTPUT
 
           echo "📦 Image tag : ${IMAGE_TAG}"
@@ -66,9 +66,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ secrets.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       # ── 5. Login to ECR ───────────────────────────────────────
       - name: Login to Amazon ECR
@@ -80,8 +80,8 @@ jobs:
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:    ${{ steps.vars.outputs.image_tag }}
-          BRANCH:       ${{ steps.vars.outputs.branch }}
+          IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
+          BRANCH: ${{ steps.vars.outputs.branch }}
         run: |
           IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           LATEST_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-${BRANCH}"
@@ -142,15 +142,28 @@ jobs:
             --task-definition ${{ secrets.TASK_DEFINITION_FAMILY }} \
             --query taskDefinition \
             > task-definition.json
+
           echo "📄 Task definition downloaded"
 
       # ── 9. Strip unsupported fields from task definition ──────
       - name: Clean task definition
         run: |
-          jq 'del(.enableFaultInjection)' task-definition.json \
-            > clean-task-definition.json
+          jq 'del(
+            .enableFaultInjection,
+            .taskDefinitionArn,
+            .requiresAttributes,
+            .compatibilities,
+            .revision,
+            .status,
+            .registeredAt,
+            .registeredBy
+          )' task-definition.json > clean-task-definition.json
+
           mv clean-task-definition.json task-definition.json
+
           echo "🧹 Cleaned task definition"
+          echo "📄 Image in task def:"
+          jq '.containerDefinitions[0].image' task-definition.json
 
       # ── 10. Inject new image URI into task definition ─────────
       - name: Update image in task definition
@@ -158,18 +171,18 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1.4.0
         with:
           task-definition: task-definition.json
-          container-name:  ${{ secrets.CONTAINER_NAME }}
-          image:           ${{ steps.build-image.outputs.image_uri }}
+          container-name: ${{ secrets.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image_uri }}
 
       # ── 11. Deploy to branch-specific ECS service ─────────────
       - name: Deploy to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition:            ${{ steps.task-def.outputs.task-definition }}
-          service:                    ${{ steps.vars.outputs.ecs_service }}
-          cluster:                    ${{ env.ECS_CLUSTER }}
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ steps.vars.outputs.ecs_service }}
+          cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-          force-new-deployment:       true
+          force-new-deployment: true
 
       # ── 12. Summary ───────────────────────────────────────────
       - name: Deployment summary
